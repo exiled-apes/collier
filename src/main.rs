@@ -38,7 +38,9 @@ fn default_rpc_url() -> String {
 enum Command {
     MineHolders(MineHolders),
     MineMetadata(MineMetadata),
+    ListMetadataUris(ListMetadataUris),
     // MineTransactions(MineTransactions),
+    // RepairSlatts(RepairSlatts),
 }
 
 #[derive(Clone, Debug, Options)]
@@ -48,10 +50,19 @@ struct MineMetadata {
 }
 
 #[derive(Clone, Debug, Options)]
+struct ListMetadataUris {
+    #[options(help = "creator address")]
+    creator_address: String,
+}
+
+#[derive(Clone, Debug, Options)]
 struct MineHolders {
     #[options(help = "creator address")]
     creator_address: String,
 }
+
+#[derive(Clone, Debug, Options)]
+struct RepairSlatts {}
 
 // #[derive(Clone, Debug, Options)]
 // struct MineTransactions {
@@ -67,6 +78,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(command) => match command {
             Command::MineHolders(opts) => mine_holders(args, opts).await,
             Command::MineMetadata(opts) => mine_metadata(args, opts).await,
+            Command::ListMetadataUris(opts) => list_metadata_uris(args, opts).await,
+            // Command::RepairSlatts(_) => (),
             // Command::MineTransactions(opts) => mine_transactions(args, opts).await,
         },
     }
@@ -187,6 +200,45 @@ async fn mine_metadata(args: Args, opts: MineMetadata) -> Result<(), Box<dyn Err
             "INSERT OR REPLACE INTO creators (creator_address, metadata_address) VALUES (?1, ?2)",
             params![opts.creator_address, metadata_address.to_string()],
         )?;
+    }
+
+    Ok(())
+}
+
+async fn list_metadata_uris(
+    args: Args,
+    _opts: ListMetadataUris,
+) -> Result<(), Box<dyn Error>> {
+    let db = Connection::open(args.db)?;
+
+    let timeout = Duration::from_secs(500); // TODO read from Args?
+    let rpc = RpcClient::new_with_timeout(args.rpc, timeout);
+
+    let mut stmt = db.prepare("SELECT metadata_address FROM metadata")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let metadata_address: String = row.get(0)?;
+
+        let mut tries = 0;
+        let account = loop {
+            tries += 1;
+            match rpc.get_account(&metadata_address.parse()?) {
+                Ok(account) => break Some(account),
+                Err(err) => {
+                    eprint!("!");
+                    if tries > 5 {
+                        eprintln!("{} {}", metadata_address, err);
+                        break None;
+                    }
+                }
+            }
+        };
+
+        if let Some(account) = account {
+            let metadata = Metadata::deserialize(&mut account.data())?;
+            let uri = metadata.data.uri.trim_matches(char::from(0));
+            println!("{},{}", metadata_address, uri);
+        }
     }
 
     Ok(())
