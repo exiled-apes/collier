@@ -1,6 +1,9 @@
 use borsh::de::BorshDeserialize;
 use gumdrop::Options;
-use metaplex_token_metadata::state::Metadata;
+use metaplex_token_metadata::{
+    instruction::update_metadata_accounts,
+    state::{Metadata, Data, Creator},
+};
 use rusqlite::{params, Connection};
 use serde::Deserialize;
 use serde_json::json;
@@ -12,7 +15,10 @@ use solana_client::{
     rpc_request::RpcRequest,
     rpc_response::Response,
 };
-use solana_sdk::{account::ReadableAccount, program_pack::Pack, pubkey::Pubkey};
+use solana_sdk::{
+    account::ReadableAccount, program_pack::Pack, pubkey::Pubkey, signature::read_keypair_file,
+    signer::Signer, transaction::Transaction,
+};
 use spl_token::state::Account;
 use std::{error::Error, time::Duration};
 
@@ -40,7 +46,7 @@ enum Command {
     MineMetadata(MineMetadata),
     ListMetadataUris(ListMetadataUris),
     // MineTransactions(MineTransactions),
-    // RepairSlatts(RepairSlatts),
+    RescueSlatts(RescueSlatts),
 }
 
 #[derive(Clone, Debug, Options)]
@@ -62,7 +68,10 @@ struct MineHolders {
 }
 
 #[derive(Clone, Debug, Options)]
-struct RepairSlatts {}
+struct RescueSlatts {
+    #[options(help = "update authority keypair")]
+    update_authority: String,
+}
 
 // #[derive(Clone, Debug, Options)]
 // struct MineTransactions {
@@ -76,13 +85,48 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match args.clone().command {
         None => todo!(),
         Some(command) => match command {
+            Command::ListMetadataUris(opts) => list_metadata_uris(args, opts).await,
             Command::MineHolders(opts) => mine_holders(args, opts).await,
             Command::MineMetadata(opts) => mine_metadata(args, opts).await,
-            Command::ListMetadataUris(opts) => list_metadata_uris(args, opts).await,
-            // Command::RepairSlatts(_) => (),
-            // Command::MineTransactions(opts) => mine_transactions(args, opts).await,
+            Command::RescueSlatts(opts) => rescue_slatts(args, opts).await,
         },
     }
+}
+
+async fn list_metadata_uris(args: Args, _opts: ListMetadataUris) -> Result<(), Box<dyn Error>> {
+    let db = Connection::open(args.db)?;
+
+    let timeout = Duration::from_secs(500); // TODO read from Args?
+    let rpc = RpcClient::new_with_timeout(args.rpc, timeout);
+
+    let mut stmt = db.prepare("SELECT metadata_address FROM metadata")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let metadata_address: String = row.get(0)?;
+
+        let mut tries = 0;
+        let account = loop {
+            tries += 1;
+            match rpc.get_account(&metadata_address.parse()?) {
+                Ok(account) => break Some(account),
+                Err(err) => {
+                    eprint!("!");
+                    if tries > 5 {
+                        eprintln!("{} {}", metadata_address, err);
+                        break None;
+                    }
+                }
+            }
+        };
+
+        if let Some(account) = account {
+            let metadata = Metadata::deserialize(&mut account.data())?;
+            let uri = metadata.data.uri.trim_matches(char::from(0));
+            println!("{},{}", metadata_address, uri);
+        }
+    }
+
+    Ok(())
 }
 
 async fn mine_holders(args: Args, _opts: MineHolders) -> Result<(), Box<dyn Error>> {
@@ -123,23 +167,6 @@ async fn mine_holders(args: Args, _opts: MineHolders) -> Result<(), Box<dyn Erro
     }
 
     Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RpcTokenAccounts {
-    pub address: String,
-    pub amount: String,
-    pub decimals: u8,
-}
-
-fn get_token_largest_accounts(
-    rpc: &RpcClient,
-    mint_address: Pubkey,
-) -> Result<Response<Vec<RpcTokenAccounts>>, Box<dyn Error>> {
-    let method = "getTokenLargestAccounts";
-    let request = RpcRequest::Custom { method };
-    let params = json!([mint_address.to_string()]);
-    Ok(rpc.send(request, params)?)
 }
 
 async fn mine_metadata(args: Args, opts: MineMetadata) -> Result<(), Box<dyn Error>> {
@@ -183,7 +210,8 @@ async fn mine_metadata(args: Args, opts: MineMetadata) -> Result<(), Box<dyn Err
                         2 + // seller fee basis points
                         1 + // whether or not there is a creators vec
                         4, // creators vec length
-                bytes: MemcmpEncodedBytes::Binary(opts.creator_address.to_string()),
+                // bytes: MemcmpEncodedBytes::Binary(opts.creator_address.to_string()),
+                bytes: MemcmpEncodedBytes::Base58(opts.creator_address.to_string()),
                 encoding: None,
             })]),
             ..RpcProgramAccountsConfig::default()
@@ -205,24 +233,23 @@ async fn mine_metadata(args: Args, opts: MineMetadata) -> Result<(), Box<dyn Err
     Ok(())
 }
 
-async fn list_metadata_uris(
-    args: Args,
-    _opts: ListMetadataUris,
-) -> Result<(), Box<dyn Error>> {
-    let db = Connection::open(args.db)?;
-
+async fn rescue_slatts(args: Args, opts: RescueSlatts) -> Result<(), Box<dyn Error>> {
     let timeout = Duration::from_secs(500); // TODO read from Args?
     let rpc = RpcClient::new_with_timeout(args.rpc, timeout);
 
-    let mut stmt = db.prepare("SELECT metadata_address FROM metadata")?;
+    let db = Connection::open(args.db)?;
+    let mut stmt = db.prepare("SELECT metadata_address, mint_address FROM metadata")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let metadata_address: String = row.get(0)?;
+        let metadata_address = metadata_address.parse()?;
+
+        // let mint_address: String = row.get(1)?;
 
         let mut tries = 0;
         let account = loop {
             tries += 1;
-            match rpc.get_account(&metadata_address.parse()?) {
+            match rpc.get_account(&metadata_address) {
                 Ok(account) => break Some(account),
                 Err(err) => {
                     eprint!("!");
@@ -235,20 +262,77 @@ async fn list_metadata_uris(
         };
 
         if let Some(account) = account {
+            let recent_blockhash = rpc.get_latest_blockhash()?;
+
             let metadata = Metadata::deserialize(&mut account.data())?;
-            let uri = metadata.data.uri.trim_matches(char::from(0));
-            println!("{},{}", metadata_address, uri);
+            let data = metadata.data;
+
+            let creators = data.clone().creators.unwrap();
+            if creators.len() != 4 {
+                continue;
+            }
+
+            let update_authority = read_keypair_file(opts.update_authority.clone())?;
+
+            let creators: Option<Vec<Creator>> = Some(vec![
+                creators[0].clone(),
+                Creator {
+                    address: update_authority.pubkey(),
+                    verified: true,
+                    share: 100,
+                },
+            ]);
+
+            let instruction = update_metadata_accounts(
+                metaplex_token_metadata::id(),
+                metadata_address,
+                update_authority.pubkey(),
+                None,
+                Some(Data {
+                    name: data.name,
+                    symbol: data.symbol,
+                    uri: data.uri,
+                    seller_fee_basis_points: data.seller_fee_basis_points,
+                    creators,
+                }),
+                None,
+            );
+
+            let instructions = [instruction];
+
+            let signing_keypairs = [&update_authority];
+
+            let tx = Transaction::new_signed_with_payer(
+                &instructions,
+                Some(&update_authority.pubkey()),
+                &signing_keypairs,
+                recent_blockhash,
+            );
+
+            // eprint!("{} {} {} > ", update_authority.pubkey(), metadata_address, mint_address);
+            // eprintln!("{:?}", tx);
+
+            let res = rpc.simulate_transaction(&tx)?;
+            eprintln!("{} {:?}\n", metadata_address, res);
         }
     }
 
     Ok(())
 }
 
-// async fn mine_transactions(args: Args, opts: MineTransactions) -> Result<(), Box<dyn Error>> {
-//     let rpc = RpcClient::new(args.rpc);
-//     let account_id = opts.account_id.parse()?;
-//     let account = rpc.get_account(&account_id)?;
-//     let _deleteme = account;
-//     let _db = Connection::open(args.db)?;
-//     Ok(())
-// }
+#[derive(Debug, Deserialize)]
+pub struct RpcTokenAccounts {
+    pub address: String,
+    pub amount: String,
+    pub decimals: u8,
+}
+
+fn get_token_largest_accounts(
+    rpc: &RpcClient,
+    mint_address: Pubkey,
+) -> Result<Response<Vec<RpcTokenAccounts>>, Box<dyn Error>> {
+    let method = "getTokenLargestAccounts";
+    let request = RpcRequest::Custom { method };
+    let params = json!([mint_address.to_string()]);
+    Ok(rpc.send(request, params)?)
+}
